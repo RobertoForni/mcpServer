@@ -1,0 +1,208 @@
+================================================================================
+AutoStore Support Agent — Azure Provisioning Request
+================================================================================
+
+Prepared for: IT Department
+Prepared by: Documentation Team
+Date: 2026-03-30
+Project: AutoStore Support Agent (AI-powered email draft generation)
+
+================================================================================
+1. WHAT THIS PROJECT DOES
+================================================================================
+
+The AutoStore Support Agent monitors a shared Outlook inbox, reads
+incoming customer emails about AutoStore API integration, searches our
+published documentation for answers, and generates draft replies for
+human review. It does NOT auto-send — a team member always reviews
+and sends.
+
+Flow:
+    Shared Inbox → Agent reads email
+                 → Classifies the topic (Azure OpenAI)
+                 → Searches AutoStore docs (ReadMe MCP server — already live)
+                 → Generates a draft reply (Azure OpenAI)
+                 → Saves draft in the shared inbox
+                 → Human reviews and sends
+
+================================================================================
+2. WHAT WE NEED FROM IT
+================================================================================
+
+    Resource 1: Azure OpenAI Service
+    Resource 2: Azure Entra ID App Registration (for Outlook access)
+    Resource 3: Azure hosting (Functions or Container Apps)
+    Resource 4: Azure Key Vault (for secrets management)
+
+Details for each resource are below.
+
+================================================================================
+3. RESOURCE 1 — AZURE OPENAI SERVICE
+================================================================================
+
+Purpose:    Email classification and reply generation (the AI brain)
+Model:      gpt-4o
+API version: 2024-12-01-preview (or latest stable)
+
+What we need provisioned:
+    - Azure OpenAI resource in a supported region (e.g., Sweden Central,
+      East US 2)
+    - One model deployment named "gpt-4o" using the GPT-4o model
+    - Sufficient token quota — estimated usage:
+        * ~2,000 tokens per email (classification + reply generation)
+        * ~10 emails per batch, every 5 minutes during business hours
+        * ~20,000 tokens per hour peak
+
+What we need returned:
+    - AZURE_OPENAI_ENDPOINT   (e.g., https://myorg.openai.azure.com/)
+    - AZURE_OPENAI_API_KEY    (key 1 or key 2)
+    - AZURE_OPENAI_DEPLOYMENT (deployment name, should be "gpt-4o")
+    - AZURE_OPENAI_API_VERSION (e.g., 2024-12-01-preview)
+
+================================================================================
+4. RESOURCE 2 — AZURE ENTRA ID APP REGISTRATION
+================================================================================
+
+Purpose:    Read emails and create drafts in a shared Outlook mailbox
+            using Microsoft Graph API (application-level, no user login)
+
+Target mailbox: integration.support@autostoresystem.com
+    (or whichever shared mailbox the team uses)
+
+Steps:
+    1. Register a new app in Azure Entra ID (Azure AD)
+       - Name: "AutoStore Support Agent"
+       - Supported account type: Single tenant
+
+    2. Add API permissions (APPLICATION type, not delegated):
+       - Microsoft Graph > Mail.ReadWrite    (read emails, create drafts)
+       - Microsoft Graph > Mail.Send         (optional, for future auto-send)
+
+    3. Grant admin consent for the permissions
+
+    4. Create a client secret
+       - Note the expiration date — set a calendar reminder to rotate
+
+    5. (Recommended) Scope access to the shared mailbox only using an
+       Application Access Policy so the app cannot read other mailboxes:
+
+       New-ApplicationAccessPolicy `
+           -AppId "<client_id>" `
+           -PolicyScopeGroupId "integration.support@autostoresystem.com" `
+           -AccessRight RestrictAccess `
+           -Description "Limit Support Agent to shared mailbox only"
+
+What we need returned:
+    - OUTLOOK_CLIENT_ID       (Application/client ID)
+    - OUTLOOK_CLIENT_SECRET   (Client secret value)
+    - OUTLOOK_TENANT_ID       (Directory/tenant ID)
+    - SHARED_MAILBOX          (e.g., integration.support@autostoresystem.com)
+
+================================================================================
+5. RESOURCE 3 — AZURE HOSTING
+================================================================================
+
+Purpose:    Run the Python agent as a long-running service
+
+Option A — Azure Container Apps (recommended):
+    - Single container running the Python polling loop
+    - Min replicas: 1 (always on during business hours)
+    - Can scale to 0 outside business hours to save cost
+    - Environment variables loaded from Key Vault
+
+Option B — Azure Functions (timer trigger):
+    - Timer-triggered function running every 5 minutes
+    - Consumption plan (pay per execution) — cheapest option
+    - Cold start may add 10-15s latency per poll cycle
+
+Requirements for either option:
+    - Python 3.12+ runtime
+    - Outbound internet access to:
+        * https://interface.autostoresystem.com (ReadMe MCP server)
+        * https://*.openai.azure.com (Azure OpenAI)
+        * https://graph.microsoft.com (Microsoft Graph / Outlook)
+        * https://login.microsoftonline.com (Entra ID auth)
+    - No inbound ports needed (agent polls outbound only)
+
+Resource sizing (minimal):
+    - CPU: 0.25 vCPU
+    - Memory: 0.5 GB
+    - Storage: minimal (no local storage needed)
+
+================================================================================
+6. RESOURCE 4 — AZURE KEY VAULT
+================================================================================
+
+Purpose:    Store secrets securely (replaces .env file in production)
+
+Secrets to store:
+    - AZURE-OPENAI-API-KEY
+    - OUTLOOK-CLIENT-SECRET
+    - README-API-KEY (we will provide this value)
+
+The hosting service (Container Apps or Functions) should use managed
+identity to pull secrets from Key Vault at startup.
+
+================================================================================
+7. SUMMARY — WHAT WE NEED BACK
+================================================================================
+
+Once provisioned, please provide these values securely (not via email):
+
+    Azure OpenAI:
+        AZURE_OPENAI_ENDPOINT    = ____________________________
+        AZURE_OPENAI_API_KEY     = ____________________________
+        AZURE_OPENAI_DEPLOYMENT  = ____________________________
+        AZURE_OPENAI_API_VERSION = ____________________________
+
+    Outlook / Microsoft Graph:
+        OUTLOOK_CLIENT_ID        = ____________________________
+        OUTLOOK_CLIENT_SECRET    = ____________________________
+        OUTLOOK_TENANT_ID        = ____________________________
+        SHARED_MAILBOX           = ____________________________
+
+    Hosting:
+        Hosting type             = Container Apps / Functions
+        Deployment method        = ____________________________
+
+    Key Vault:
+        Key Vault name           = ____________________________
+
+================================================================================
+8. TIMELINE
+================================================================================
+
+    Priority 1 (blocking — cannot test without these):
+        - Azure OpenAI resource + gpt-4o deployment
+        - Entra ID app registration + Graph permissions
+
+    Priority 2 (needed for production, not for initial testing):
+        - Azure hosting (Container Apps or Functions)
+        - Key Vault setup
+
+    For initial testing, we can run the agent locally from a developer
+    machine using the credentials above. Hosting is only needed when
+    we move to production.
+
+================================================================================
+9. QUESTIONS FOR THE MEETING
+================================================================================
+
+    1. Which Azure region should we use? (must support Azure OpenAI)
+    2. Does IT prefer Container Apps or Functions for hosting?
+    3. What is the process for rotating the Entra ID client secret?
+    4. Can IT set up the Application Access Policy to restrict the app
+       to the shared mailbox only?
+    5. Is there an existing Key Vault we should use, or create a new one?
+    6. What is the naming convention for Azure resources?
+
+================================================================================
+10. CODE REPOSITORY
+================================================================================
+
+    GitHub: https://github.com/RobertoForni/mcpServer
+    Agent code: agent/ directory (main.py, config.py, readme_client.py,
+                outlook_client.py)
+    Dependencies: requirements.txt (Python 3.12+, 6 packages)
+
+================================================================================

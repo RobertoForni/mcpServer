@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "autostore-docs": {
+      "url": "https://interface.autostoresystem.com/mcp",
+      "headers": {
+        "x-readme-auth": "bearer YOUR_README_API_KEY"
+      }
+    }
+  }
+}

@@ -1,0 +1,12 @@
+.env
+config/mcp.json
+*.key
+*.pem
+__pycache__/
+*.pyc
+.venv/
+venv/
+.cursor/mcp.json
+.vscode/
+Thumbs.db
+.DS_Store

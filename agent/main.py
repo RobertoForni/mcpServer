@@ -9,9 +9,9 @@ using Azure OpenAI, and saves them in the mailbox for human review.
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
-from openai import AsyncAzureOpenAI
+from openai import AsyncAzureOpenAI, RateLimitError
 
 from config import Config
 from readme_client import ReadMeClient
@@ -23,9 +23,43 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Categories that should NOT generate a doc-based reply
+# Category overrides — used as a safety net when the LLM returns
+# an incorrect action for a known category.
 ESCALATE_CATEGORIES = {"Error or Bug", "Out of Scope", "Urgent or Angry"}
 REDIRECT_CATEGORIES = {"Hardware/Service"}
+
+# Truncate retrieved docs to stay within the model's context window.
+# ~12 000 chars ≈ 3 000 tokens, well within gpt-4o's limit even
+# after adding the system prompt, templates, and email.
+MAX_CONTEXT_CHARS = 12_000
+
+# Retry settings for transient Azure OpenAI failures (429, 5xx).
+MAX_RETRIES = 2
+RETRY_BASE_SECONDS = 2
+
+
+# ---------------------------------------------------------------------------
+# Retry helper
+# ---------------------------------------------------------------------------
+async def _call_with_retry(coro_func, description: str = "API call"):
+    """
+    Retry an async callable on RateLimitError with exponential back-off.
+    Other exceptions propagate immediately.
+    """
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            return await coro_func()
+        except RateLimitError:
+            if attempt < MAX_RETRIES:
+                wait = RETRY_BASE_SECONDS ** (attempt + 1)
+                logger.warning(
+                    "Rate limited on %s, retrying in %ds (attempt %d/%d)",
+                    description, wait, attempt + 1, MAX_RETRIES,
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error("Rate limit exceeded after %d retries: %s", MAX_RETRIES, description)
+                raise
 
 
 # ---------------------------------------------------------------------------
@@ -47,27 +81,40 @@ async def classify_email(
         f"{email['body']}"
     )
 
-    response = await openai_client.chat.completions.create(
-        model=Config.AZURE_OPENAI_DEPLOYMENT,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    f"{classification_prompt}\n\n"
-                    "Respond with JSON: {\"category\": \"...\", "
-                    "\"action\": \"search_docs|escalate|redirect\", "
-                    "\"search_terms\": [\"term1\", \"term2\"], "
-                    "\"confidence\": \"high|medium|low\"}"
-                ),
-            },
-            {"role": "user", "content": email_text},
-        ],
+    response = await _call_with_retry(
+        lambda: openai_client.chat.completions.create(
+            model=Config.AZURE_OPENAI_DEPLOYMENT,
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"{classification_prompt}\n\n"
+                        "Respond with JSON: {\"category\": \"...\", "
+                        "\"action\": \"search_docs|escalate|redirect\", "
+                        "\"search_terms\": [\"term1\", \"term2\"], "
+                        "\"confidence\": \"high|medium|low\"}"
+                    ),
+                },
+                {"role": "user", "content": email_text},
+            ],
+        ),
+        description="classify_email",
     )
 
     result_text = response.choices[0].message.content or "{}"
     result = json.loads(result_text)
+
+    # Safety net: override the LLM's action if the category is in
+    # a hardcoded set.  This prevents misrouting even if the model
+    # returns an unexpected action value.
+    category = result.get("category", "")
+    if category in REDIRECT_CATEGORIES:
+        result["action"] = "redirect"
+    elif category in ESCALATE_CATEGORIES:
+        result["action"] = "escalate"
+
     logger.info(
         "Classified as: %s (action: %s, confidence: %s)",
         result.get("category"),
@@ -105,6 +152,12 @@ async def retrieve_docs(
 
     if not docs_content:
         logger.warning("No documentation found for terms: %s", search_terms)
+    elif len(docs_content) > MAX_CONTEXT_CHARS:
+        logger.info(
+            "Truncating docs context from %d to %d chars",
+            len(docs_content), MAX_CONTEXT_CHARS,
+        )
+        docs_content = docs_content[:MAX_CONTEXT_CHARS] + "\n\n[... truncated]"
 
     return docs_content
 
@@ -149,26 +202,31 @@ async def generate_reply(
         f"{email['body']}"
     )
 
-    response = await openai_client.chat.completions.create(
-        model=Config.AZURE_OPENAI_DEPLOYMENT,
-        temperature=0.3,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    f"{system_prompt}\n\n"
-                    f"---\nReply Templates:\n{reply_templates}"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"{chr(10).join(context_parts)}\n\n"
-                    f"---\nCustomer email:\n{email_text}\n\n"
-                    "Draft a reply following the system prompt rules."
-                ),
-            },
-        ],
+    context_block = "\n".join(context_parts)
+
+    response = await _call_with_retry(
+        lambda: openai_client.chat.completions.create(
+            model=Config.AZURE_OPENAI_DEPLOYMENT,
+            temperature=0.3,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"{system_prompt}\n\n"
+                        f"---\nReply Templates:\n{reply_templates}"
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"{context_block}\n\n"
+                        f"---\nCustomer email:\n{email_text}\n\n"
+                        "Draft a reply following the system prompt rules."
+                    ),
+                },
+            ],
+        ),
+        description="generate_reply",
     )
 
     reply = response.choices[0].message.content or ""
@@ -211,7 +269,7 @@ async def process_email(
         "draft_created": False,
         "draft_id": None,
         "error": None,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
     try:
@@ -221,13 +279,13 @@ async def process_email(
         result["action"] = classification.get("action")
         result["confidence"] = classification.get("confidence")
 
-        # Step 2-3: Retrieve documentation (skip for redirects)
+        # Steps 2-3: Retrieve documentation
+        # Search docs for both "search_docs" and "escalate" actions —
+        # escalation replies can include partial info from documentation.
+        # Skip only for "redirect" (hardware/service — no docs needed).
         docs_context = ""
         action = classification.get("action", "search_docs")
-        if action == "search_docs":
-            docs_context = await retrieve_docs(readme_client, classification)
-        elif action == "escalate":
-            # Still search docs — escalation replies can include partial info
+        if action in ("search_docs", "escalate"):
             docs_context = await retrieve_docs(readme_client, classification)
 
         # Step 4: Generate reply
